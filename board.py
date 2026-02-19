@@ -29,6 +29,114 @@ total_sessions = [0]
 _status_flash = {}  # task_id -> timestamp of last status change
 _selected_idx = [0]  # index of currently selected task row
 _confirm_kill = [False]  # True when waiting for Y/N
+_dir_picker_open = [False]       # Modal state for directory picker
+_dir_picker_idx = [0]            # Highlighted item in picker
+_dir_picker_scroll = [0]         # Scroll offset for long lists
+_dir_picker_typing = [False]     # True when in path-input mode
+_dir_picker_input = [""]         # Text buffer for typed path
+_recent_dirs = []                # MRU list of directory paths
+_recent_dirs_lock = threading.Lock()
+RECENT_DIRS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recent_dirs.txt")
+RECENT_DIRS_MAX = 5
+DIR_PICKER_VISIBLE = 15
+
+def _load_recent_dirs():
+    """Read recent_dirs.txt on startup, filter to existing dirs."""
+    global _recent_dirs
+    with _recent_dirs_lock:
+        try:
+            with open(RECENT_DIRS_FILE, "r") as f:
+                dirs = [line.strip() for line in f if line.strip()]
+            _recent_dirs = [d for d in dirs if os.path.isdir(d)]
+        except FileNotFoundError:
+            _recent_dirs = []
+
+def _save_recent_dirs():
+    """Write MRU list to disk."""
+    with _recent_dirs_lock:
+        try:
+            with open(RECENT_DIRS_FILE, "w") as f:
+                for d in _recent_dirs:
+                    f.write(d + "\n")
+        except OSError:
+            pass
+
+def _track_directory(cwd):
+    """Add/promote a directory to the front of the MRU list."""
+    if not cwd or not cwd.strip():
+        return
+    cwd = os.path.normpath(cwd)
+    with _recent_dirs_lock:
+        if cwd in _recent_dirs:
+            _recent_dirs.remove(cwd)
+        _recent_dirs.insert(0, cwd)
+        del _recent_dirs[RECENT_DIRS_MAX:]
+    _save_recent_dirs()
+
+def _tab_complete_path(partial):
+    """Return the longest common completion for a partial path."""
+    expanded = os.path.expanduser(partial)
+    if os.path.isdir(expanded) and not expanded.endswith("/"):
+        return partial + "/"
+    dirname = os.path.dirname(expanded)
+    basename = os.path.basename(expanded)
+    if not os.path.isdir(dirname):
+        return partial
+    try:
+        entries = [e for e in os.listdir(dirname) if e.startswith(basename) and os.path.isdir(os.path.join(dirname, e))]
+    except OSError:
+        return partial
+    if not entries:
+        return partial
+    if len(entries) == 1:
+        completed = os.path.join(dirname, entries[0]) + "/"
+        # Re-shorten with ~ if original used ~
+        home = os.path.expanduser("~")
+        if partial.startswith("~") and completed.startswith(home):
+            completed = "~" + completed[len(home):]
+        return completed
+    # Multiple matches — complete to longest common prefix
+    common = os.path.commonprefix(entries)
+    if len(common) > len(basename):
+        completed = os.path.join(dirname, common)
+        home = os.path.expanduser("~")
+        if partial.startswith("~") and completed.startswith(home):
+            completed = "~" + completed[len(home):]
+        return completed
+    return partial
+
+def _shell_escape(s):
+    """Escape a string for safe embedding in AppleScript."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+def spawn_claude_in_terminal(directory):
+    """Open a new terminal window and run claude in the given directory."""
+    escaped = _shell_escape(directory)
+    term = os.environ.get("TERM_PROGRAM", "")
+    if term == "iTerm.app":
+        script = (
+            'tell application "iTerm"\n'
+            '  create window with default profile\n'
+            '  tell current session of current window\n'
+            '    write text "cd \\"{}\\"; claude"\n'
+            '  end tell\n'
+            'end tell'
+        ).format(escaped)
+    else:
+        script = (
+            'tell application "Terminal"\n'
+            '  do script "cd \\"{}\\"; claude"\n'
+            '  activate\n'
+            'end tell'
+        ).format(escaped)
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
 
 class TaskCreate(BaseModel):
     id: str
@@ -69,6 +177,8 @@ def create_task(body: TaskCreate):
         }
         total_sessions[0] += 1
         _status_flash[body.id] = time.time()
+    if cwd and cwd.strip():
+        _track_directory(cwd)
     return {"ok": True}
 
 @app.patch("/task/{task_id}")
@@ -145,6 +255,92 @@ def kill_task_by_index(visible_tasks):
             tasks[tid]["finished_at"] = time.time()
             tasks[tid]["exit_code"] = -15
             _status_flash[tid] = time.time()
+
+
+def discover_existing_sessions():
+    """Find already-running claude CLI processes and register them as tasks."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,ppid,comm"],
+            capture_output=True, text=True, timeout=5
+        )
+    except Exception:
+        return
+    claude_procs = []  # (claude_pid, shell_pid)
+    for line in result.stdout.strip().split("\n")[1:]:
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+                comm = " ".join(parts[2:])
+            except ValueError:
+                continue
+            # Match /opt/homebrew/bin/claude or similar, but not Claude.app
+            if "claude" in comm.lower() and "Claude.app" not in comm and ppid != 1:
+                claude_procs.append((pid, ppid))
+
+    my_pid = os.getpid()
+    for claude_pid, shell_pid in claude_procs:
+        if claude_pid == my_pid or shell_pid == my_pid:
+            continue
+        # Get cwd via lsof
+        cwd = None
+        try:
+            lsof = subprocess.run(
+                ["lsof", "-a", "-p", str(claude_pid), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5
+            )
+            for ln in lsof.stdout.strip().split("\n"):
+                if ln.startswith("n"):
+                    cwd = ln[1:]
+                    break
+        except Exception:
+            pass
+
+        folder = os.path.basename(cwd) if cwd else "unknown"
+
+        # Try to get git branch
+        branch = None
+        if cwd:
+            try:
+                gb = subprocess.run(
+                    ["git", "-C", cwd, "symbolic-ref", "--short", "HEAD"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if gb.returncode == 0 and gb.stdout.strip():
+                    branch = gb.stdout.strip()
+            except Exception:
+                pass
+
+        name = "{} ({})".format(folder, branch) if branch else folder
+        group = folder if cwd else "General"
+        task_id = "discovered-{}-{}".format(claude_pid, int(time.time()))
+
+        with lock:
+            # Don't re-register if we already track this shell_pid
+            already = any(t["shell_pid"] == shell_pid for t in tasks.values())
+            if already:
+                continue
+            tasks[task_id] = {
+                "id": task_id,
+                "name": name,
+                "status": "IDLE",
+                "shell_pid": shell_pid,
+                "claude_pid": claude_pid,
+                "cwd": cwd,
+                "group": group,
+                "started_at": time.time(),
+                "work_started_at": None,
+                "finished_at": None,
+                "exit_code": None,
+                "high_count": 0,
+                "low_count": 0,
+            }
+            total_sessions[0] += 1
+            _status_flash[task_id] = time.time()
+
+        if cwd:
+            _track_directory(cwd)
 
 
 def get_child_pids(parent_pid):
@@ -242,6 +438,7 @@ def cpu_monitor_loop():
                 if tid not in tasks:
                     continue
                 tt = tasks[tid]
+                tt["cpu"] = cpu
                 if cpu > 5:
                     tt["high_count"] = tt.get("high_count", 0) + 1
                     tt["low_count"] = 0
@@ -319,7 +516,7 @@ def draw_hsep(scr, y, x, width, attr=0):
     safe_addstr(scr, y, x, BOX_LT + BOX_H * (width - 2) + BOX_RT, attr)
 
 
-TICKER_BASE = "Welcome to Claude Central {} Sessions are auto-detected {} Status updates every 2s".format(SYM_DOT, SYM_DOT)
+TICKER_BASE = "Welcome to Claude Central {} Press [N] to launch a new session {} Status updates every 2s".format(SYM_DOT, SYM_DOT)
 _ticker_offset = [0]
 
 
@@ -344,6 +541,116 @@ def build_ticker(visible, now):
         parts.append("{} active now".format(running))
     sep = " {} ".format(SYM_DOT)
     return sep.join(parts)
+
+
+def _fill_rect(stdscr, y, x, width, height, attr=0):
+    """Fill a rectangle with blank spaces to clear the area behind an overlay."""
+    h, w = stdscr.getmaxyx()
+    blank = " " * width
+    for i in range(height):
+        if 0 <= y + i < h and x < w:
+            safe_addstr(stdscr, y + i, x, blank, attr)
+
+def draw_dir_picker(stdscr, BORDER, WHITE, DIM):
+    """Draw a centered directory picker overlay."""
+    h, w = stdscr.getmaxyx()
+    pw = 54  # picker width
+    typing = _dir_picker_typing[0]
+    with _recent_dirs_lock:
+        dirs = list(_recent_dirs)
+
+    # Calculate height: title(1) + hsep(1) + input row(1) + hsep(1)
+    #   + content rows + blank(1) + footer(1) + border top/bottom(2)
+    if not dirs and not typing:
+        content_h = 1  # "No recent directories."
+    elif not dirs:
+        content_h = 0
+    else:
+        content_h = min(len(dirs), DIR_PICKER_VISIBLE)
+        if _dir_picker_scroll[0] > 0:
+            content_h += 1  # scroll up indicator
+        if _dir_picker_scroll[0] + DIR_PICKER_VISIBLE < len(dirs):
+            content_h += 1  # scroll down indicator
+
+    # input row + hsep below it = 2 extra rows
+    ph = 2 + 1 + 1 + 1 + content_h + 1 + 1 + 1
+    px = max(0, (w - pw) // 2)
+    py = max(0, (h - ph) // 2)
+
+    _fill_rect(stdscr, py, px, pw, ph)
+    draw_box(stdscr, py, px, pw, ph, BORDER)
+    safe_addstr(stdscr, py + 1, px + 2, "Launch Claude Agent", WHITE)
+    draw_hsep(stdscr, py + 2, px, pw, BORDER)
+
+    # ── Path input row ──
+    row = py + 3
+    input_max = pw - 10
+    path_text = _dir_picker_input[0]
+    if len(path_text) > input_max:
+        path_text = "..." + path_text[-(input_max - 3):]
+    if typing:
+        safe_addstr(stdscr, row, px + 2, "Path:", WHITE)
+        safe_addstr(stdscr, row, px + 8, path_text, WHITE)
+        # cursor
+        cursor_x = px + 8 + len(path_text)
+        if cursor_x < px + pw - 2:
+            safe_addstr(stdscr, row, cursor_x, "_", WHITE)
+    else:
+        safe_addstr(stdscr, row, px + 2, "Path:", DIM)
+        hint = path_text if path_text else "press / to type a path"
+        safe_addstr(stdscr, row, px + 8, hint, DIM)
+
+    draw_hsep(stdscr, row + 1, px, pw, BORDER)
+    row += 2
+
+    # ── Directory list ──
+    home = os.path.expanduser("~")
+    if not dirs and not typing:
+        safe_addstr(stdscr, row, px + 4, "No recent directories.", DIM)
+        row += 1
+    elif dirs:
+        has_scroll_up = _dir_picker_scroll[0] > 0
+        has_scroll_down = _dir_picker_scroll[0] + DIR_PICKER_VISIBLE < len(dirs)
+        if has_scroll_up:
+            safe_addstr(stdscr, row, px + (pw // 2), "^", DIM)
+            row += 1
+
+        scroll = _dir_picker_scroll[0]
+        max_path_len = pw - 8
+        visible_count = min(len(dirs), DIR_PICKER_VISIBLE)
+        for i in range(visible_count):
+            di = scroll + i
+            if di >= len(dirs):
+                break
+            d = dirs[di]
+            if d.startswith(home):
+                display_path = "~" + d[len(home):]
+            else:
+                display_path = d
+            if len(display_path) > max_path_len:
+                display_path = "..." + display_path[-(max_path_len - 3):]
+
+            selected = (di == _dir_picker_idx[0]) and not typing
+            if selected:
+                safe_addstr(stdscr, row, px + 2, SYM_SELECT, WHITE)
+                safe_addstr(stdscr, row, px + 4, display_path, WHITE)
+            else:
+                safe_addstr(stdscr, row, px + 4, display_path, DIM)
+            row += 1
+
+        if has_scroll_down:
+            safe_addstr(stdscr, row, px + (pw // 2), "v", DIM)
+            row += 1
+
+    row += 1  # blank line
+    if typing:
+        footer = "[Enter] Launch  [Tab] Complete  [Esc] Back"
+    else:
+        footer = "[Enter] Launch  [/] Type path  [Esc] Cancel"
+    # Truncate footer if wider than box
+    if len(footer) > pw - 4:
+        footer = footer[:pw - 4]
+    safe_addstr(stdscr, row, px + (pw - len(footer)) // 2, footer, DIM)
 
 
 def display_loop(stdscr):
@@ -477,7 +784,8 @@ def display_loop(stdscr):
         row += 1
         safe_addstr(stdscr, row, ox + 4, "DESTINATION", AMBER)
         safe_addstr(stdscr, row, ox + 32, "STATUS", AMBER)
-        safe_addstr(stdscr, row, ox + 54, "TIME", AMBER)
+        safe_addstr(stdscr, row, ox + 47, "TIME", AMBER)
+        safe_addstr(stdscr, row, ox + 58, "CPU", AMBER)
 
         # ── Thin separator ──
         row += 1
@@ -521,6 +829,9 @@ def display_loop(stdscr):
                     flash_time = _status_flash.get(t["id"], 0)
                     flashing = (now - flash_time) < 2.0
 
+                    cpu_val = t.get("cpu", 0.0)
+                    cpu_str = "{:.0f}%".format(cpu_val) if cpu_val >= 1 else ""
+
                     if st == "RUNNING":
                         el = fmt_elapsed(now - (t["work_started_at"] or t["started_at"]))
                         ind = IND_RUN_ON if int(now * 2) % 2 == 0 else IND_RUN_OFF
@@ -529,28 +840,32 @@ def display_loop(stdscr):
                         safe_addstr(stdscr, row, ox + 3, ind, c)
                         safe_addstr(stdscr, row, ox + 5, name, nc)
                         safe_addstr(stdscr, row, ox + 32, "Running", c)
-                        safe_addstr(stdscr, row, ox + 54, el, c)
+                        safe_addstr(stdscr, row, ox + 47, el, c)
+                        if cpu_str:
+                            safe_addstr(stdscr, row, ox + 58, cpu_str, c)
                     elif st == "IDLE":
                         el = fmt_elapsed(now - t["started_at"])
                         c = DIM | curses.A_REVERSE if flashing else DIM
                         safe_addstr(stdscr, row, ox + 3, IND_IDLE, c)
                         safe_addstr(stdscr, row, ox + 5, name, c)
                         safe_addstr(stdscr, row, ox + 32, "Waiting", c)
-                        safe_addstr(stdscr, row, ox + 54, el, c)
+                        safe_addstr(stdscr, row, ox + 47, el, c)
+                        if cpu_str:
+                            safe_addstr(stdscr, row, ox + 58, cpu_str, DIM)
                     elif st == "DONE":
                         el = fmt_elapsed(t["finished_at"] - t["started_at"])
                         c = GREEN | curses.A_REVERSE if flashing else GREEN
                         safe_addstr(stdscr, row, ox + 3, IND_DONE, c)
                         safe_addstr(stdscr, row, ox + 5, name, c)
                         safe_addstr(stdscr, row, ox + 32, "Complete", c)
-                        safe_addstr(stdscr, row, ox + 54, el, c)
+                        safe_addstr(stdscr, row, ox + 47, el, c)
                     elif st == "KILLED":
                         el = fmt_elapsed(t["finished_at"] - t["started_at"])
                         c = KILLED_C | curses.A_REVERSE if flashing else KILLED_C
                         safe_addstr(stdscr, row, ox + 3, IND_KILLED, c)
                         safe_addstr(stdscr, row, ox + 5, name, c)
                         safe_addstr(stdscr, row, ox + 32, "Killed", c)
-                        safe_addstr(stdscr, row, ox + 54, el, c)
+                        safe_addstr(stdscr, row, ox + 47, el, c)
                     elif st == "FAILED":
                         el = fmt_elapsed(t["finished_at"] - t["started_at"])
                         ec = t.get("exit_code")
@@ -559,7 +874,7 @@ def display_loop(stdscr):
                         safe_addstr(stdscr, row, ox + 3, IND_FAIL, c)
                         safe_addstr(stdscr, row, ox + 5, name, c)
                         safe_addstr(stdscr, row, ox + 32, label, c)
-                        safe_addstr(stdscr, row, ox + 54, el, c)
+                        safe_addstr(stdscr, row, ox + 47, el, c)
                     row += 1
 
         # ── Skip blank row (covered by box border interior) ──
@@ -586,7 +901,7 @@ def display_loop(stdscr):
         # ── Address + controls ──
         row += 1
         safe_addstr(stdscr, row, ox + 4, "localhost:8080", DIM)
-        controls = "[K] Kill  [Q] Quit"
+        controls = "[N] New  [K] Kill  [Q] Quit"
         safe_addstr(stdscr, row, ox + BW - 2 - len(controls), controls, DIM)
 
         # ── Scrolling ticker (dynamic) ──
@@ -599,6 +914,10 @@ def display_loop(stdscr):
             display = (padded[idx:] + padded)[:ticker_w]
             safe_addstr(stdscr, row, ox + 3, display, TICKER)
             _ticker_offset[0] += 1
+
+        # ── Directory picker overlay ──
+        if _dir_picker_open[0]:
+            draw_dir_picker(stdscr, BORDER, WHITE, DIM)
 
         # ── Kill confirmation bar ──
         if _confirm_kill[0] and flat_tasks:
@@ -622,6 +941,56 @@ def display_loop(stdscr):
                 _confirm_kill[0] = False
                 continue
 
+            # ── Directory picker mode ──
+            if _dir_picker_open[0]:
+                if _dir_picker_typing[0]:
+                    # ── Typing sub-mode ──
+                    if key == 27:  # Escape — back to list mode
+                        _dir_picker_typing[0] = False
+                    elif key == ord('\t'):  # Tab — complete path
+                        _dir_picker_input[0] = _tab_complete_path(_dir_picker_input[0])
+                    elif key in (curses.KEY_BACKSPACE, 127, 8):
+                        _dir_picker_input[0] = _dir_picker_input[0][:-1]
+                    elif key == ord('\n') or key == curses.KEY_ENTER:
+                        raw = _dir_picker_input[0].strip()
+                        if raw:
+                            expanded = os.path.expanduser(raw)
+                            expanded = os.path.abspath(expanded)
+                            _dir_picker_open[0] = False
+                            _dir_picker_typing[0] = False
+                            _track_directory(expanded)
+                            spawn_claude_in_terminal(expanded)
+                    elif 32 <= key <= 126:  # printable ASCII
+                        _dir_picker_input[0] += chr(key)
+                else:
+                    # ── List sub-mode ──
+                    if key == 27:  # Escape
+                        _dir_picker_open[0] = False
+                    elif key == ord('/'):
+                        _dir_picker_typing[0] = True
+                        _dir_picker_input[0] = ""
+                    elif key == curses.KEY_UP:
+                        _dir_picker_idx[0] = max(0, _dir_picker_idx[0] - 1)
+                        if _dir_picker_idx[0] < _dir_picker_scroll[0]:
+                            _dir_picker_scroll[0] = _dir_picker_idx[0]
+                    elif key == curses.KEY_DOWN:
+                        with _recent_dirs_lock:
+                            max_idx = len(_recent_dirs) - 1
+                        if max_idx >= 0:
+                            _dir_picker_idx[0] = min(max_idx, _dir_picker_idx[0] + 1)
+                            if _dir_picker_idx[0] >= _dir_picker_scroll[0] + DIR_PICKER_VISIBLE:
+                                _dir_picker_scroll[0] = _dir_picker_idx[0] - DIR_PICKER_VISIBLE + 1
+                    elif key == ord('\n') or key == curses.KEY_ENTER:
+                        with _recent_dirs_lock:
+                            dirs = list(_recent_dirs)
+                        idx = _dir_picker_idx[0]
+                        if 0 <= idx < len(dirs):
+                            chosen = dirs[idx]
+                            _dir_picker_open[0] = False
+                            _track_directory(chosen)
+                            spawn_claude_in_terminal(chosen)
+                continue
+
             # ── Normal mode ──
             if key == ord('q') or key == ord('Q'):
                 should_quit.set()
@@ -635,6 +1004,12 @@ def display_loop(stdscr):
                     sel = _selected_idx[0]
                     if 0 <= sel < len(flat_tasks) and flat_tasks[sel]["status"] in ("IDLE", "RUNNING"):
                         _confirm_kill[0] = True
+            elif key == ord('n') or key == ord('N'):
+                _dir_picker_open[0] = True
+                _dir_picker_idx[0] = 0
+                _dir_picker_scroll[0] = 0
+                _dir_picker_typing[0] = False
+                _dir_picker_input[0] = ""
         except Exception:
             pass
 
@@ -646,6 +1021,8 @@ def handle_signal(sig, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+    _load_recent_dirs()
+    discover_existing_sessions()
 
     server_thread = threading.Thread(
         target=uvicorn.run, args=(app,),
