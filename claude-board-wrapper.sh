@@ -2,8 +2,8 @@
 BOARD_SERVER="${BOARD_SERVER:-http://localhost:8080}"
 
 if [ -z "$REAL_CLAUDE" ]; then
-  # whence -p (zsh) skips functions and finds the actual binary
-  REAL_CLAUDE="$(whence -p claude 2>/dev/null || command -v claude 2>/dev/null)"
+  # whence -p (zsh) / type -P (bash) skip functions and find the actual binary
+  REAL_CLAUDE="$(whence -p claude 2>/dev/null || type -P claude 2>/dev/null)"
 fi
 
 claude() {
