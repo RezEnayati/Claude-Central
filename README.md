@@ -1,6 +1,6 @@
 # Claude Central
 
-A terminal dashboard for monitoring and launching [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions. Displays an MTA arrival-board style UI with real-time status, CPU usage, and session lifecycle tracking.
+A terminal dashboard for monitoring and launching [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions. Displays a real-time board UI with status tracking, CPU usage, and session lifecycle management.
 
 ![Python 3](https://img.shields.io/badge/python-3.10+-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
@@ -8,6 +8,7 @@ A terminal dashboard for monitoring and launching [Claude Code](https://docs.ant
 
 - **macOS** (uses AppleScript for terminal window management)
 - **Python 3.10+**
+- **zsh** or **bash**
 - **Claude Code CLI** installed and available on your `PATH`
 - Python packages: `fastapi`, `uvicorn`, `pydantic`
 
@@ -21,22 +22,27 @@ pip install fastapi uvicorn pydantic
 
 ## Quick Start
 
-### 1. Start the board
+### 1. Set up the shell wrapper
+
+Add the wrapper to your shell profile so every `claude` invocation is automatically tracked on the board:
+
+```bash
+# zsh
+echo 'source ~/.claude-board/claude-board-wrapper.sh' >> ~/.zshrc
+source ~/.zshrc
+
+# bash
+echo 'source ~/.claude-board/claude-board-wrapper.sh' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 2. Start the board
 
 ```bash
 python3 ~/.claude-board/board.py
 ```
 
 This launches the dashboard and a local API server on `localhost:8080`. Any Claude sessions already running will be auto-discovered.
-
-### 2. Set up the shell wrapper (optional)
-
-Source the wrapper in your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so every `claude` invocation is automatically tracked:
-
-```bash
-echo 'source ~/.claude-board/claude-board-wrapper.sh' >> ~/.zshrc
-source ~/.zshrc
-```
 
 Now running `claude` in any terminal will register the session on the board.
 
